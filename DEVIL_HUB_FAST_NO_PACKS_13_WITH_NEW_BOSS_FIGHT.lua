@@ -3700,7 +3700,7 @@ local AutoFarm = window:AddTab("✨تمرين و ريبر")
 getgenv()._AutoRepFarmEnabled = false  
 
 -- Switch en la librería
-AutoFarm:AddSwitch("تمرين قوة💪(استعمله اذا كان بنقك اقل من 250 )", function(state)
+getgenv()._DEVIL_RepFarmToggle = AutoFarm:AddSwitch("تمرين قوة💪(استعمله اذا كان بنقك اقل من 250 )", function(state)
     getgenv()._AutoRepFarmEnabled = state
     warn("[Auto Rep Farm] Estado cambiado a:", state and "ON" or "OFF")
 end)
@@ -4299,7 +4299,7 @@ local function getStrengthRequiredForRebirth()
 end
 
 -- Switch en la library
-fastStrengthFolder:AddSwitch("🔥ريبر سريع", function(state)
+getgenv()._DEVIL_FastRebirthToggle = fastStrengthFolder:AddSwitch("🔥ريبر سريع", function(state)
     getgenv().AutoFarming = state
 
     if state then
@@ -4398,7 +4398,7 @@ local function equipNoPacksRebirthPets()
     equipPetByName(NoPacksRebirthPet)
 end
 
-fastStrengthFolder:AddSwitch("ريبر سريع بدون باكات", function(state)
+getgenv()._DEVIL_FastRebirthNoPacksToggle = fastStrengthFolder:AddSwitch("ريبر سريع بدون باكات", function(state)
     getgenv().AutoFarmingNoPacks = state
 
     if state then
@@ -4456,6 +4456,7 @@ end, {clear = false})
 
 -- Toggle para llegar al rebirth objetivo
 local targetRebirthToggle = rebirthFolder:AddSwitch("Start", function(enabled)
+
     farmingTarget = enabled
     if enabled then
         task.spawn(function()
@@ -4657,9 +4658,11 @@ end)
 
 
 ------------------------------------------------------------------
--- BOSS FIGHT - ESCANOR AUTO BOSS + SMOOTH DODGE (INTEGRATED)
--- Replaces the old Auto Boss system with the two supplied scripts' logic.
--- Everything else in DEVIL HUB is kept unchanged.
+------------------------------------------------------------------
+-- BOSS FIGHT - ESCANOR AUTO BOSS + SMOOTH DODGE
+-- Exact combat logic from gistfile1 (4), with the World Boss
+-- manager behavior from gistfile1 (3) adapted to DEVIL HUB's
+-- existing training flags.
 ------------------------------------------------------------------
 do
     local BossFight = window:AddTab("Boss Fight")
@@ -4667,215 +4670,213 @@ do
     local Players = game:GetService("Players")
     local RunService = game:GetService("RunService")
     local Workspace = game:GetService("Workspace")
+    local TweenService = game:GetService("TweenService")
+    local UserInputService = game:GetService("UserInputService")
     local SoundService = game:GetService("SoundService")
     local LocalPlayer = Players.LocalPlayer
 
-    -- Core Auto Boss state from the supplied Escanor system.
-    local AutoBoss = false
-    local AutoPunch = false
-    local AutoChest = false
-    local BossSystemEnabled = false
-
-    local AttackDistance = 3
-    local DodgeDistance = 180
-    local FloatHeight = 15
-
-    local Dodging = false
-    local Connections = {}
-    local LastSequence = {}
+    -- EXACT ESCANOR AUTO BOSS STATE
+    local AutoBoss, AutoPunch, AutoChest = false, false, false
+    local AutoBossToggle, AutoPunchToggle, AutoChestToggle
+    local AttackDistance, DodgeDistance, FloatHeight = 3, 180, 15
+    local Dodging, Connections, LastSequence, ToggleSetters = false, {}, {}, {}
     local BossRenderConn
 
-    -- Training state is captured before Boss Fight takes over.
-    local trainingPausedForBoss = false
-    local savedTrainingState = nil
-    local bossWasAlive = false
-    local bossCycleStarted = false
-    local bossCycleFinished = false
-    local lastBossReference = nil
+    -- DEVIL training state manager
+    local autoLeaveForBoss = true
+    local previousStates = {
+        RepFarm = false,
+        FastRebirth = false,
+        FastRebirthNoPacks = false,
+        TargetRebirth = false,
+    }
+    local bossStoppedForPrep = false
+    local postBossProcessed = false
+    local isBossAlive = false
+    local currentBossHP = 0
+    local bossSeen = false
 
     local function SetLabel(label, text)
-        pcall(function() label.Text = text end)
         pcall(function() label:Set(text) end)
+        pcall(function() label.Text = text end)
     end
 
     local timerLabel = BossFight:AddLabel("⏳ SPAWN IN: 00:00:00")
-    timerLabel.TextSize = 18
     local hpLabel = BossFight:AddLabel("👑 BOSS HP: SEARCHING...")
-    hpLabel.TextSize = 18
-
     local bossFolder = BossFight:AddFolder("🔥 ESCANOR AUTO BOSS")
 
-    bossFolder:AddLabel("النظام الجديد: Auto Boss + Auto Punch + Auto Claim Chest + Smooth Dodge")
+    bossFolder:AddLabel("AUTO BOSS + AUTO PUNCH + AUTO CLAIM CHEST + SMOOTH DODGE")
+    AutoBossToggle = bossFolder:AddSwitch("AUTO BOSS COMBAT", function(state)
+        AutoBoss = state
+        if state then
+            setupAllBosses()
+        else
+            Dodging = false
+            disconnectBossConnections()
+        end
+    end)
+    AutoPunchToggle = bossFolder:AddSwitch("AUTO PUNCH", function(state)
+        AutoPunch = state
+    end)
+    AutoChestToggle = bossFolder:AddSwitch("AUTO CLAIM CHEST", function(state)
+        AutoChest = state
+    end)
+    bossFolder:AddTextBox("MELEE DISTANCE (1-15)", function(value)
+        local n = tonumber(value)
+        if n then AttackDistance = math.clamp(n, 1, 15) end
+    end, {clear = false})
+    bossFolder:AddTextBox("STOMP DODGE DISTANCE (50-300)", function(value)
+        local n = tonumber(value)
+        if n then DodgeDistance = math.clamp(n, 50, 300) end
+    end, {clear = false})
+    bossFolder:AddSwitch("AUTO LEAVE / RESUME TRAINING", function(state)
+        autoLeaveForBoss = state
+    end)
+    bossFolder:AddLabel("Melee: 3 | Dodge: 180 | Height: 15")
 
     local function GetArena()
-        local events = Workspace:FindFirstChild("Events")
-        return events and events:FindFirstChild("BossArena")
+        local Events = Workspace:FindFirstChild("Events")
+        return Events and Events:FindFirstChild("BossArena")
     end
 
-    local function GetHealth(model)
-        if not model then return nil, nil, nil end
+    local function GetHealth(Model)
+        if not Model then return nil, nil, nil end
+        local Humanoid = Model:FindFirstChildOfClass("Humanoid")
+        if Humanoid then return Humanoid.Health, Humanoid.MaxHealth, Humanoid end
 
-        local humanoid = model:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            return humanoid.Health, humanoid.MaxHealth, humanoid
-        end
-
-        local currentHP, maxHP
-        local function readNumber(obj)
-            if obj:IsA("NumberValue") or obj:IsA("IntValue") then
-                return obj.Value
-            end
-            return nil
-        end
-
-        for _, obj in ipairs(model:GetDescendants()) do
-            local n = readNumber(obj)
-            if n ~= nil then
-                local name = string.lower(obj.Name)
-                if name == "health" or name == "hp" or name == "currenthealth" then
-                    currentHP = n
-                elseif name == "maxhealth" or name == "maxhp" or name == "maximumhealth" then
-                    maxHP = n
+        local CurrentHP, MaxHP
+        for Name, Value in pairs(Model:GetAttributes()) do
+            local N = tostring(Name):lower()
+            if typeof(Value) == "number" then
+                if N == "hp" or N == "health" or N == "currenthp" or N == "currenthealth" or N == "healthcurrent" then
+                    CurrentHP = Value
+                end
+                if N == "maxhp" or N == "maxhealth" or N == "maximumhealth" or N == "healthmax" then
+                    MaxHP = Value
                 end
             end
         end
+        for _, Object in ipairs(Model:GetDescendants()) do
+            if Object:IsA("NumberValue") or Object:IsA("IntValue") then
+                local N = Object.Name:lower()
+                if N == "hp" or N == "health" or N == "currenthp" or N == "currenthealth" then
+                    CurrentHP = Object.Value
+                end
+                if N == "maxhp" or N == "maxhealth" or N == "maximumhealth" then
+                    MaxHP = Object.Value
+                end
+            end
+        end
+        return CurrentHP, MaxHP, nil
+    end
 
-        local attrHP = model:GetAttribute("Health")
-            or model:GetAttribute("HP")
-            or model:GetAttribute("CurrentHealth")
-        local attrMaxHP = model:GetAttribute("MaxHealth")
-            or model:GetAttribute("MaxHP")
-            or model:GetAttribute("MaximumHealth")
-
-        currentHP = currentHP or attrHP
-        maxHP = maxHP or attrMaxHP
-
-        return currentHP, maxHP, nil
+    local function IsBossModel(Model, Arena)
+        if not Model:IsA("Model") or Model == Arena then return false end
+        if Model.Name:lower():find("boss", 1, true) then return true end
+        local HP, MaxHP = GetHealth(Model)
+        return (MaxHP and MaxHP >= 1000) or (HP and HP >= 1000) or false
     end
 
     local function FindBoss()
-        local arena = GetArena()
-        if not arena then return nil end
-
-        local bestBoss
-        local bestMaxHP = 0
-
-        for _, object in ipairs(arena:GetDescendants()) do
-            if object:IsA("Model") and object ~= arena then
-                local hp, maxHP = GetHealth(object)
-                local compareHP = maxHP or hp or 0
-                if compareHP > bestMaxHP then
-                    bestMaxHP = compareHP
-                    bestBoss = object
+        local Arena = GetArena()
+        if not Arena then return nil end
+        local BestBoss, BestMaxHP = nil, 0
+        for _, Object in ipairs(Arena:GetDescendants()) do
+            if IsBossModel(Object, Arena) then
+                local HP, MaxHP = GetHealth(Object)
+                if HP or MaxHP then
+                    local CompareHP = MaxHP or HP or 0
+                    if CompareHP > BestMaxHP then
+                        BestMaxHP = CompareHP
+                        BestBoss = Object
+                    end
                 end
             end
         end
-
-        return bestBoss
+        return BestBoss
     end
 
-    local function getBoss(number)
-        local arena = GetArena()
-        if not arena then return nil end
-
-        local bossContainer = arena:FindFirstChild("Boss" .. number)
-        if not bossContainer then return nil end
-
-        local boss = bossContainer:FindFirstChild("Boss")
-        if boss and boss:IsA("BasePart") then
-            return boss
+    local function getBoss(Number)
+        local Arena = GetArena()
+        if not Arena then return nil end
+        local BossName = "Boss" .. Number
+        local Boss = Arena:FindFirstChild(BossName)
+        if Boss then return Boss end
+        for _, obj in ipairs(Arena:GetDescendants()) do
+            if obj.Name == BossName and obj:IsA("Model") then return obj end
         end
-
-        if bossContainer:IsA("Model") then
-            return bossContainer.PrimaryPart or bossContainer:FindFirstChild("HumanoidRootPart")
-        end
-
         return nil
     end
 
-    local function disconnectBossConnections()
+    function disconnectBossConnections()
         for _, list in pairs(Connections) do
-            for _, connection in ipairs(list) do
-                pcall(function() connection:Disconnect() end)
+            for _, conn in ipairs(list) do
+                pcall(function() conn:Disconnect() end)
             end
         end
         Connections = {}
         LastSequence = {}
     end
 
-    local function setupBossEvents(boss, number)
-        if not boss then return end
+    local function executeFloatingDodge(boss)
+        if not AutoBoss or Dodging then return end
+        task.wait(1.5)
+        if not AutoBoss then return end
 
-        if Connections[number] then
-            for _, connection in ipairs(Connections[number]) do
-                pcall(function() connection:Disconnect() end)
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+
+        local AttackCF = boss:GetAttribute("BossAttackCFrame")
+        local ImpactTime = boss:GetAttribute("BossAttackImpactTime")
+        Dodging = true
+
+        local baseCF = (typeof(AttackCF) == "CFrame") and AttackCF or root.CFrame
+        root.CFrame = CFrame.new(
+            baseCF.Position - (baseCF.LookVector * DodgeDistance) + Vector3.new(0, FloatHeight, 0),
+            baseCF.Position
+        )
+
+        local waitTime = 0.8
+        if typeof(ImpactTime) == "number" then
+            local serverTime
+            pcall(function() serverTime = Workspace:GetServerTimeNow() end)
+            if serverTime then
+                waitTime = math.clamp(ImpactTime - serverTime, 0.2, 5)
             end
         end
 
-        Connections[number] = {}
-        LastSequence[number] = nil
+        task.wait(waitTime + 0.4)
+
+        local bossRoot = boss:FindFirstChild("HumanoidRootPart") or (boss:IsA("Model") and boss.PrimaryPart)
+        if bossRoot and root then
+            local targetCFrame = bossRoot.CFrame * CFrame.new(0, 0, AttackDistance)
+            local startCFrame = root.CFrame
+            for i = 1, 12 do
+                if not AutoBoss then break end
+                root.CFrame = startCFrame:Lerp(targetCFrame, i / 12)
+                task.wait(0.02)
+            end
+        end
+        Dodging = false
+    end
+
+    local function setupBossEvents(boss, number)
+        if not boss then return end
+        if Connections[number] then
+            for _, conn in ipairs(Connections[number]) do
+                pcall(function() conn:Disconnect() end)
+            end
+        end
+        Connections[number], LastSequence[number] = {}, nil
 
         local function checkAttack()
             if not AutoBoss then return end
-
-            local sequence = boss:GetAttribute("BossAttackSequence")
-            local kind = boss:GetAttribute("BossAttackKind")
-
-            if sequence == nil or tostring(kind) ~= "Stomp" or LastSequence[number] == sequence then
-                return
-            end
-
-            LastSequence[number] = sequence
-
-            task.spawn(function()
-                if not AutoBoss or Dodging then return end
-
-                task.wait(1.5)
-                if not AutoBoss then return end
-
-                local character = LocalPlayer.Character
-                local root = character and character:FindFirstChild("HumanoidRootPart")
-                if not root then return end
-
-                local attackCF = boss:GetAttribute("BossAttackCFrame")
-                local impactTime = boss:GetAttribute("BossAttackImpactTime")
-                Dodging = true
-
-                local baseCF = (typeof(attackCF) == "CFrame") and attackCF or root.CFrame
-                root.CFrame = CFrame.new(
-                    baseCF.Position - (baseCF.LookVector * DodgeDistance) + Vector3.new(0, FloatHeight, 0),
-                    baseCF.Position
-                )
-
-                local waitTime = 0.8
-                if typeof(impactTime) == "number" then
-                    local serverTime
-                    pcall(function()
-                        serverTime = Workspace:GetServerTimeNow()
-                    end)
-                    if serverTime then
-                        waitTime = math.clamp(impactTime - serverTime, 0.2, 5)
-                    end
-                end
-
-                task.wait(waitTime + 0.4)
-
-                local bossRoot = boss:FindFirstChild("HumanoidRootPart")
-                    or (boss:IsA("Model") and boss.PrimaryPart)
-                    or boss
-
-                if bossRoot and root and root.Parent and AutoBoss then
-                    local targetCFrame = bossRoot.CFrame * CFrame.new(0, 0, AttackDistance)
-                    local startCFrame = root.CFrame
-                    for i = 1, 12 do
-                        if not AutoBoss then break end
-                        root.CFrame = startCFrame:Lerp(targetCFrame, i / 12)
-                        task.wait(0.02)
-                    end
-                end
-
-                Dodging = false
-            end)
+            local Sequence = boss:GetAttribute("BossAttackSequence")
+            local Kind = boss:GetAttribute("BossAttackKind")
+            if Sequence == nil or tostring(Kind) ~= "Stomp" or LastSequence[number] == Sequence then return end
+            LastSequence[number] = Sequence
+            task.spawn(function() executeFloatingDodge(boss) end)
         end
 
         table.insert(Connections[number], boss:GetAttributeChangedSignal("BossAttackSequence"):Connect(checkAttack))
@@ -4886,324 +4887,239 @@ do
         end))
     end
 
-    local function setupAllBosses()
-        disconnectBossConnections()
-        for number = 1, 5 do
-            local boss = getBoss(number)
-            if boss then
-                setupBossEvents(boss, number)
-            end
+    function setupAllBosses()
+        for num = 1, 5 do
+            local boss = getBoss(num)
+            if boss then setupBossEvents(boss, num) end
         end
     end
 
-    local function equipPunch()
-        local character = LocalPlayer.Character
-        local backpack = LocalPlayer:FindFirstChild("Backpack")
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        if not character or not humanoid or humanoid.Health <= 0 then return end
+    local alertSound = Instance.new("Sound")
+    alertSound.Name = "BossSpawnAlertSound"
+    alertSound.SoundId = "rbxassetid://9114223178"
+    alertSound.Volume = 2.5
+    alertSound.Parent = SoundService
 
-        local punch = character:FindFirstChild("Punch") or (backpack and backpack:FindFirstChild("Punch"))
-        if punch and punch.Parent ~= character then
-            pcall(function() humanoid:EquipTool(punch) end)
-        end
-
-        if punch and punch:IsA("Tool") then
-            pcall(function() punch:Activate() end)
-        end
-    end
-
-    local function TryClaimPrompt(prompt)
-        if not AutoChest or not prompt or not prompt:IsA("ProximityPrompt") then return end
-
-        local actionText = string.lower(prompt.ActionText or "")
-        local objectText = string.lower(prompt.ObjectText or "")
-
-        if actionText:find("claim") or objectText:find("chest") then
-            if type(fireproximityprompt) == "function" then
-                pcall(function() fireproximityprompt(prompt) end)
-            end
-        end
-    end
-
-    local function captureTrainingState()
-        if trainingPausedForBoss then return end
-
-        savedTrainingState = {
-            RepFarm = getgenv()._AutoRepFarmEnabled == true,
-            FastRebirth = getgenv().AutoFarming == true,
-            FastRebirthNoPacks = getgenv().AutoFarmingNoPacks == true,
-            TargetRebirth = farmingTarget == true,
-        }
-
-        trainingPausedForBoss = true
-    end
-
-    local function stopTrainingForBoss()
-        captureTrainingState()
-
-        getgenv()._AutoRepFarmEnabled = false
-        getgenv().AutoFarming = false
-        getgenv().AutoFarmingNoPacks = false
-
-        if farmingTarget then
-            farmingTarget = false
-            pcall(function()
-                if targetRebirthToggle then
-                    targetRebirthToggle:Set(false)
-                end
-            end)
-        end
-    end
-
-    local function restoreTrainingAfterBoss()
-        if not trainingPausedForBoss or not savedTrainingState then return end
-
-        local saved = savedTrainingState
-        savedTrainingState = nil
-        trainingPausedForBoss = false
-
-        getgenv()._AutoRepFarmEnabled = saved.RepFarm
-        getgenv().AutoFarming = saved.FastRebirth
-        getgenv().AutoFarmingNoPacks = saved.FastRebirthNoPacks
-
-        if saved.TargetRebirth then
-            pcall(function()
-                if targetRebirthToggle then
-                    targetRebirthToggle:Set(true)
-                else
-                    farmingTarget = true
-                end
-            end)
-        else
-            farmingTarget = false
-        end
-    end
-
-    local function setCombatToggles(state)
-        AutoBoss = state
-        AutoPunch = state
-        AutoChest = state
-
-        if state then
+    -- EXACT ESCANOR SetAllToggles behavior.
+    local function SetAllToggles(targetState)
+        if targetState then
+            if AutoBossToggle then pcall(function() AutoBossToggle:Set(true) end) else AutoBoss = true end
+            if AutoPunchToggle then pcall(function() AutoPunchToggle:Set(true) end) else AutoPunch = true end
+            if AutoChestToggle then pcall(function() AutoChestToggle:Set(true) end) else AutoChest = true end
+            AutoBoss, AutoPunch, AutoChest = true, true, true
             setupAllBosses()
         else
+            if AutoBossToggle then pcall(function() AutoBossToggle:Set(false) end) else AutoBoss = false end
+            if AutoPunchToggle then pcall(function() AutoPunchToggle:Set(false) end) else AutoPunch = false end
+            if AutoChestToggle then pcall(function() AutoChestToggle:Set(false) end) else AutoChest = false end
+            AutoBoss, AutoPunch, AutoChest = false, false, false
             Dodging = false
             disconnectBossConnections()
         end
     end
 
-    -- Controls: same three actions and two distance controls from the supplied script.
-    bossFolder:AddSwitch("AUTO BOSS COMBAT", function(state)
-        AutoBoss = state
-        if state then
-            BossSystemEnabled = true
-            setupAllBosses()
-        else
-            if not AutoPunch and not AutoChest then
-                BossSystemEnabled = false
-            end
+    -- Auto Claim Chest: same detection and 0.5s scan used by Escanor.
+    local function TryClaimPrompt(prompt)
+        if not AutoChest or not prompt:IsA("ProximityPrompt") then return end
+        local act = string.lower(prompt.ActionText or "")
+        local obj = string.lower(prompt.ObjectText or "")
+        if act:find("claim") or obj:find("chest") then
+            pcall(function() fireproximityprompt(prompt) end)
         end
-    end)
+    end
 
-    bossFolder:AddSwitch("AUTO PUNCH", function(state)
-        AutoPunch = state
-        if state then BossSystemEnabled = true end
-    end)
-
-    bossFolder:AddSwitch("AUTO CLAIM CHEST", function(state)
-        AutoChest = state
-        if state then BossSystemEnabled = true end
-    end)
-
-    bossFolder:AddTextBox("MELEE DISTANCE (1-15)", function(value)
-        local number = tonumber(value)
-        if number then
-            AttackDistance = math.clamp(number, 1, 15)
-        end
-    end, {clear = false})
-
-    bossFolder:AddTextBox("STOMP DODGE DISTANCE (50-300)", function(value)
-        local number = tonumber(value)
-        if number then
-            DodgeDistance = math.clamp(number, 50, 300)
-        end
-    end, {clear = false})
-
-    BossFight:AddLabel("⚙️ Melee: 3 | Dodge: 180 | Height: 15")
-    BossFight:AddLabel("ℹ️ عند بدء البوس يتم إيقاف التمرين الحالي وحفظ حالته ثم استعادته بعد موت البوس.")
-
-    local alertSound = Instance.new("Sound")
-    alertSound.Name = "DEVIL_BossSpawnAlert"
-    alertSound.SoundId = "rbxassetid://9114223178"
-    alertSound.Volume = 2.5
-    alertSound.Parent = SoundService
-
-    -- Auto Claim Chest: copied from the supplied Auto Boss script.
-    Workspace.DescendantAdded:Connect(function(object)
-        if object:IsA("ProximityPrompt") then
-            task.delay(0.1, function()
-                TryClaimPrompt(object)
-            end)
+    Workspace.DescendantAdded:Connect(function(obj)
+        if obj:IsA("ProximityPrompt") then
+            task.delay(0.1, function() TryClaimPrompt(obj) end)
         end
     end)
 
     task.spawn(function()
         while task.wait(0.5) do
             if AutoChest then
-                for _, object in ipairs(Workspace:GetDescendants()) do
-                    TryClaimPrompt(object)
+                for _, obj in ipairs(Workspace:GetDescendants()) do
+                    TryClaimPrompt(obj)
                 end
             end
         end
     end)
 
-    -- Auto Punch loop from the supplied script.
+    -- Auto Punch: exact 0.1 second loop from Escanor.
     task.spawn(function()
         while task.wait(0.1) do
             if AutoPunch then
-                equipPunch()
+                local char = LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local backpack = LocalPlayer:FindFirstChild("Backpack")
+                if char and hum and hum.Health > 0 then
+                    local punch = char:FindFirstChild("Punch") or (backpack and backpack:FindFirstChild("Punch"))
+                    if punch then
+                        if punch.Parent ~= char then hum:EquipTool(punch) end
+                        punch:Activate()
+                    end
+                end
             end
         end
     end)
 
-    -- Actual Boss movement / Smooth Dodge engine.
-    if BossRenderConn then
-        pcall(function() BossRenderConn:Disconnect() end)
-    end
-
+    -- Exact boss follow engine from Escanor.
+    if BossRenderConn then pcall(function() BossRenderConn:Disconnect() end) end
     BossRenderConn = RunService.RenderStepped:Connect(function()
         if not AutoBoss or Dodging then return end
-
         local activeBoss = getBoss(1) or getBoss(2) or getBoss(3) or getBoss(4) or getBoss(5)
-        if not activeBoss then return end
-
-        local character = LocalPlayer.Character
-        local root = character and character:FindFirstChild("HumanoidRootPart")
-        local bossRoot = activeBoss:FindFirstChild("HumanoidRootPart")
-            or (activeBoss:IsA("Model") and activeBoss.PrimaryPart)
-            or activeBoss
-
-        if root and bossRoot then
-            root.CFrame = bossRoot.CFrame * CFrame.new(0, 0, AttackDistance)
+        if activeBoss then
+            local char = LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local bossRoot = activeBoss:FindFirstChild("HumanoidRootPart") or (activeBoss:IsA("Model") and activeBoss.PrimaryPart)
+            if root and bossRoot then
+                root.CFrame = bossRoot.CFrame * CFrame.new(0, 0, AttackDistance)
+            end
         end
     end)
 
-    LocalPlayer.CharacterAdded:Connect(function()
-        task.wait(1)
-        if AutoBoss then
-            setupAllBosses()
-        end
-    end)
-
-    -- Live Boss HP display and boss-state detection.
+    -- Boss HP/live state.
     task.spawn(function()
         while task.wait(0.5) do
-            local boss = FindBoss()
-            if not boss then
-                SetLabel(hpLabel, "👑 BOSS HP: SEARCHING...")
+            local Arena = GetArena()
+            if not Arena then
+                SetLabel(hpLabel, "👑 BOSS HP: ARENA NOT FOUND")
+                isBossAlive, currentBossHP = false, 0
             else
-                local hp, maxHP = GetHealth(boss)
-                if hp ~= nil then
-                    lastBossReference = boss
-                    if hp > 0 then
-                        bossWasAlive = true
-                        if maxHP then
-                            SetLabel(hpLabel, "👑 " .. boss.Name .. ": " .. tostring(math.floor(hp)) .. " / " .. tostring(math.floor(maxHP)))
+                local Boss = FindBoss()
+                if not Boss then
+                    SetLabel(hpLabel, "👑 BOSS HP: NO BOSS SPAWNED")
+                    isBossAlive, currentBossHP = false, 0
+                else
+                    local HP, MaxHP = GetHealth(Boss)
+                    if HP and HP > 0 then
+                        isBossAlive, currentBossHP, bossSeen = true, HP, true
+                        if MaxHP then
+                            SetLabel(hpLabel, "👑 " .. Boss.Name .. ": " .. tostring(math.floor(HP)) .. " / " .. tostring(math.floor(MaxHP)))
                         else
-                            SetLabel(hpLabel, "👑 " .. boss.Name .. ": " .. tostring(math.floor(hp)))
+                            SetLabel(hpLabel, "👑 " .. Boss.Name .. ": " .. tostring(math.floor(HP)))
                         end
                     else
                         SetLabel(hpLabel, "👑 BOSS HP: DEAD")
+                        isBossAlive, currentBossHP = false, 0
                     end
-                else
-                    SetLabel(hpLabel, "👑 BOSS HP: SEARCHING...")
                 end
             end
         end
     end)
 
-    -- Main 3-hour manager from the supplied scripts, adapted to DEVIL's training states.
-    task.spawn(function()
-        local hasPlayedSound = false
+    local function captureTrainingState()
+        if bossStoppedForPrep then return end
+        previousStates.RepFarm = getgenv()._AutoRepFarmEnabled == true
+        previousStates.FastRebirth = getgenv().AutoFarming == true
+        previousStates.FastRebirthNoPacks = getgenv().AutoFarmingNoPacks == true
+        previousStates.TargetRebirth = farmingTarget == true
+    end
 
-        while task.wait(0.1) do
-            local secondsLeft = 10800 - (os.time() % 10800)
-            if secondsLeft == 10800 then secondsLeft = 0 end
+    local function stopTraining()
+        getgenv()._AutoRepFarmEnabled = false
+        getgenv().AutoFarming = false
+        getgenv().AutoFarmingNoPacks = false
+        if getgenv()._DEVIL_RepFarmToggle then pcall(function() getgenv()._DEVIL_RepFarmToggle:Set(false) end) end
+        if getgenv()._DEVIL_FastRebirthToggle then pcall(function() getgenv()._DEVIL_FastRebirthToggle:Set(false) end) end
+        if getgenv()._DEVIL_FastRebirthNoPacksToggle then pcall(function() getgenv()._DEVIL_FastRebirthNoPacksToggle:Set(false) end) end
+        if farmingTarget then
+            farmingTarget = false
+            if getgenv()._DEVIL_TargetRebirthToggle then pcall(function() getgenv()._DEVIL_TargetRebirthToggle:Set(false) end) end
+        end
+    end
 
-            local hours = math.floor(secondsLeft / 3600)
-            local minutes = math.floor((secondsLeft % 3600) / 60)
-            local seconds = secondsLeft % 60
+    local function resumeTraining()
+        if previousStates.RepFarm and getgenv()._DEVIL_RepFarmToggle then
+            pcall(function() getgenv()._DEVIL_RepFarmToggle:Set(true) end)
+        elseif previousStates.RepFarm then
+            getgenv()._AutoRepFarmEnabled = true
+        end
+        if previousStates.FastRebirth and getgenv()._DEVIL_FastRebirthToggle then
+            pcall(function() getgenv()._DEVIL_FastRebirthToggle:Set(true) end)
+        elseif previousStates.FastRebirth then
+            getgenv().AutoFarming = true
+        end
+        if previousStates.FastRebirthNoPacks and getgenv()._DEVIL_FastRebirthNoPacksToggle then
+            pcall(function() getgenv()._DEVIL_FastRebirthNoPacksToggle:Set(true) end)
+        elseif previousStates.FastRebirthNoPacks then
+            getgenv().AutoFarmingNoPacks = true
+        end
+        if previousStates.TargetRebirth and getgenv()._DEVIL_TargetRebirthToggle then
+            pcall(function() getgenv()._DEVIL_TargetRebirthToggle:Set(true) end)
+        elseif previousStates.TargetRebirth then
+            farmingTarget = true
+        end
+    end
 
-            if secondsLeft == 0 then
-                SetLabel(timerLabel, "🚨 BOSS SPAWNING NOW!")
-                if not hasPlayedSound then
-                    pcall(function() alertSound:Play() end)
-                    hasPlayedSound = true
-                end
-            else
-                SetLabel(timerLabel, string.format("⏳ SPAWN IN: %02d:%02d:%02d", hours, minutes, seconds))
-                hasPlayedSound = false
-            end
+    local function prepareForBoss()
+        if bossStoppedForPrep or not autoLeaveForBoss then return end
+        bossStoppedForPrep = true
+        postBossProcessed = false
+        captureTrainingState()
+        stopTraining()
+        SetAllToggles(true)
+    end
 
-            -- The supplied manager prepares 15 seconds before the boss.
-            if BossSystemEnabled and secondsLeft <= 15 and secondsLeft > 0 then
-                if not bossCycleStarted then
-                    bossCycleStarted = true
-                    bossCycleFinished = false
-                    bossWasAlive = false
-                    captureTrainingState()
-                    stopTrainingForBoss()
-                    setCombatToggles(true)
-                end
-            end
+    local function processBossEnd()
+        if not bossStoppedForPrep or postBossProcessed then return end
+        postBossProcessed = true
+        task.spawn(function()
+            task.wait(3)
+            SetAllToggles(false)
+            resumeTraining()
+            bossStoppedForPrep = false
+            bossSeen = false
+        end)
+    end
 
-            -- Also react immediately if the boss is already detected.
-            local currentBoss = FindBoss()
-            if BossSystemEnabled and currentBoss then
-                local hp = select(1, GetHealth(currentBoss))
-                if hp and hp > 0 then
-                    if not trainingPausedForBoss then
-                        stopTrainingForBoss()
-                    end
-                    if not AutoBoss then AutoBoss = true end
-                    if not AutoPunch then AutoPunch = true end
-                    if not AutoChest then AutoChest = true end
-                    bossWasAlive = true
-                    lastBossReference = currentBoss
-                end
-            end
+    -- CharacterAdded behavior from Escanor.
+    LocalPlayer.CharacterAdded:Connect(function()
+        task.wait(1)
+        if AutoBoss then setupAllBosses() end
+    end)
 
-            -- Once the boss is dead and the 3-hour window has rolled forward,
-            -- restore exactly the training flags that were active before Boss Fight.
-            if bossCycleStarted and not bossCycleFinished and secondsLeft > 15 then
-                local boss = FindBoss()
-                local hp = boss and select(1, GetHealth(boss)) or 0
-                local bossDead = (bossWasAlive and (not boss or hp == nil or hp <= 0))
+    -- 3-hour timer + 15-second preparation + automatic resume.
+    RunService.RenderStepped:Connect(function()
+        local totalSecInDay = (os.date("!*t").hour * 3600) + (os.date("!*t").min * 60) + os.date("!*t").sec
+        local secLeft = 10800 - (totalSecInDay % 10800)
+        if secLeft == 10800 then secLeft = 0 end
 
-                if bossDead then
-                    bossCycleFinished = true
-                    setCombatToggles(false)
+        if secLeft == 0 then
+            SetLabel(timerLabel, "⏳ SPAWN IN: BOSS SPAWNING NOW!")
+            if not bossSeen then pcall(function() alertSound:Play() end) end
+        else
+            local hrs = math.floor(secLeft / 3600)
+            local mins = math.floor((secLeft % 3600) / 60)
+            local secs = secLeft % 60
+            SetLabel(timerLabel, string.format("⏳ SPAWN IN: %02d:%02d:%02d", hrs, mins, secs))
+        end
 
-                    task.spawn(function()
-                        task.wait(3)
-                        restoreTrainingAfterBoss()
-                        bossCycleStarted = false
-                        bossWasAlive = false
-                        lastBossReference = nil
-                    end)
-                end
-            end
+        -- Same 15-second safety window as Escanor manager.
+        if autoLeaveForBoss and secLeft <= 15 and secLeft > 0 then
+            prepareForBoss()
+        end
 
-            -- If the user disables the Boss Combat manually while we paused training,
-            -- return to the exact previous training state instead of leaving it stopped.
-            if not AutoBoss and not AutoPunch and not AutoChest and trainingPausedForBoss and not bossWasAlive then
-                restoreTrainingAfterBoss()
-                bossCycleStarted = false
-                bossCycleFinished = false
-            end
+        -- If a boss is already spawned, take over immediately.
+        local liveBoss = FindBoss()
+        if liveBoss then
+            if not bossStoppedForPrep and autoLeaveForBoss then prepareForBoss() end
+        elseif bossStoppedForPrep and not isBossAlive and currentBossHP <= 0 and secLeft > 15 then
+            processBossEnd()
+        end
+    end)
+
+    -- Detect boss folder creation immediately, not only on the 3-hour tick.
+    Workspace.DescendantAdded:Connect(function(obj)
+        if not autoLeaveForBoss then return end
+        if obj.Name == "Boss1" or obj.Name == "Boss2" or obj.Name == "Boss3" or obj.Name == "Boss4" or obj.Name == "Boss5" then
+            task.defer(function()
+                if FindBoss() and not bossStoppedForPrep then prepareForBoss() end
+            end)
         end
     end)
 end
+
+getgenv()._DEVIL_TargetRebirthToggle = targetRebirthToggle
 
 local estadisticas = window:AddTab("طاقات")
 
